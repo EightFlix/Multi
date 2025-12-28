@@ -1,0 +1,569 @@
+import logging
+import re
+import base64
+import time
+from struct import pack
+from datetime import datetime
+from bson import ObjectId
+
+from pymongo import MongoClient, TEXT
+from pymongo.errors import DuplicateKeyError, PyMongoError
+from hydrogram.file_id import FileId
+
+from info import (
+    DATABASE_URL,
+    DATABASE_NAME,
+    MAX_BTN,
+    USE_CAPTION_FILTER
+)
+
+logger = logging.getLogger(__name__)
+
+# ======================================================
+# 📦 DATABASE CONNECTION (SINGLE DB)
+# ======================================================
+
+try:
+    client = MongoClient(
+        DATABASE_URL,
+        maxPoolSize=50,
+        minPoolSize=10,
+        maxIdleTimeMS=45000,
+        serverSelectionTimeoutMS=5000
+    )
+    # Test connection
+    client.server_info()
+    logger.info("✅ MongoDB connected successfully")
+except PyMongoError as e:
+    logger.error(f"❌ MongoDB connection failed: {e}")
+    raise
+
+db = client[DATABASE_NAME]
+
+primary_collection = db["primary_files"]
+cloud_collection   = db["cloud_files"]
+archive_collection = db["archive_files"]
+
+COLLECTIONS = {
+    "primary": primary_collection,
+    "cloud": cloud_collection,
+    "archive": archive_collection
+}
+
+# ======================================================
+# ⚙️ INDEXES (CRITICAL FOR SPEED)
+# ======================================================
+
+def create_indexes():
+    try:
+        for col in COLLECTIONS.values():
+            # 🔥 TEXT INDEX (FAST SEARCH)
+            col.create_index([("search_key", TEXT)])
+
+            # 🔒 SAME FILE CAN EXIST IN MULTIPLE COLLECTIONS
+            col.create_index(
+                [("file_id", 1), ("collection_type", 1)],
+                unique=True
+            )
+
+            # SUPPORTING INDEXES
+            col.create_index("added_date")
+            col.create_index("file_size")
+            col.create_index("file_type")
+
+        logger.info("✅ MongoDB indexes ready (Ultra Fast)")
+    except PyMongoError as e:
+        logger.error(f"❌ Index creation failed: {e}")
+
+create_indexes()
+
+# ======================================================
+# ⚡ SEARCH CACHE (RAM) - WITH SIZE LIMIT
+# ======================================================
+
+SEARCH_CACHE = {}        # key -> (timestamp, data)
+CACHE_TTL = 300          # 5 minutes
+MAX_CACHE_SIZE = 1000    # Maximum 1000 entries
+
+def clean_old_cache():
+    """Remove expired and excess cache entries"""
+    now = time.time()
+    
+    # Remove expired entries
+    expired = [k for k, (ts, _) in SEARCH_CACHE.items() if now - ts > CACHE_TTL]
+    for k in expired:
+        del SEARCH_CACHE[k]
+    
+    # If still too large, remove oldest entries
+    if len(SEARCH_CACHE) > MAX_CACHE_SIZE:
+        sorted_items = sorted(SEARCH_CACHE.items(), key=lambda x: x[1][0])
+        to_remove = len(SEARCH_CACHE) - MAX_CACHE_SIZE
+        for k, _ in sorted_items[:to_remove]:
+            del SEARCH_CACHE[k]
+
+# ======================================================
+# 🧠 HELPERS
+# ======================================================
+
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"@\w+", "", text)
+    text = re.sub(r"[^a-z0-9 ]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def get_collection(name: str):
+    return COLLECTIONS.get(name, primary_collection)
+
+# ======================================================
+# 💾 SAVE / INDEX FILE (ADMIN SELECTED COLLECTION)
+# ======================================================
+
+async def save_file(media, collection_name: str):
+    """
+    Index file into selected collection.
+    Same file CAN exist in multiple collections.
+    """
+    try:
+        file_id = unpack_new_file_id(media.file_id)
+
+        file_name = media.file_name or ""
+        caption = media.caption or ""
+
+        # 🔥 WEIGHTED SEARCH KEY (file_name x2)
+        if USE_CAPTION_FILTER:
+            search_key = normalize(f"{file_name} {file_name} {caption}")
+        else:
+            search_key = normalize(f"{file_name} {file_name}")
+
+        document = {
+            "_id": ObjectId(),
+            "file_id": file_id,
+            "file_name": file_name,
+            "caption": caption,
+            "search_key": search_key,
+            "file_size": media.file_size,
+            "file_type": getattr(media, "mime_type", "unknown"),
+            "collection_type": collection_name,
+            "added_date": datetime.utcnow(),
+            "downloads": 0,
+            "last_accessed": datetime.utcnow()
+        }
+
+        col = get_collection(collection_name)
+        col.insert_one(document)
+        
+        SEARCH_CACHE.clear()  # clear cache on new index
+        logger.info(f"✅ Indexed in {collection_name}: {file_name}")
+        return "suc", collection_name
+
+    except DuplicateKeyError:
+        logger.warning(f"⚠️ Already indexed in {collection_name}: {file_name}")
+        return "dup", collection_name
+    except Exception as e:
+        logger.error(f"❌ Save file error: {e}")
+        return "err", collection_name
+
+# ======================================================
+# 🔍 ULTRA FAST SEARCH (TEXT + CACHE) - MEMORY SAFE
+# ======================================================
+
+async def get_search_results(query, collection_name=None, offset=0, limit=MAX_BTN):
+    query = query.strip().lower()
+    if not query:
+        return [], "", 0, {}
+
+    cache_key = f"{query}:{collection_name}:{offset}"
+    now = time.time()
+
+    # ⚡ CACHE HIT
+    if cache_key in SEARCH_CACHE:
+        ts, data = SEARCH_CACHE[cache_key]
+        if now - ts < CACHE_TTL:
+            return data
+
+    # 🔥 TOKENIZED TEXT SEARCH (AND LOGIC)
+    tokens = query.split()
+    text_query = {"$text": {"$search": " ".join(tokens)}}
+
+    results = []
+    counts = {}
+
+    collections = (
+        {collection_name: get_collection(collection_name)}
+        if collection_name
+        else COLLECTIONS
+    )
+
+    try:
+        for name, col in collections.items():
+            # MEMORY SAFE: Skip and limit on database level
+            cursor = (
+                col.find(
+                    text_query,
+                    {"score": {"$meta": "textScore"}}
+                )
+                .sort([("score", {"$meta": "textScore"})])
+                .limit(1000)  # Limit to prevent memory overload
+            )
+
+            docs = list(cursor)
+            for d in docs:
+                d["source_collection"] = name
+
+            counts[name] = col.count_documents(text_query)
+            results.extend(docs)
+
+        total = len(results)
+        files = results[offset: offset + limit]
+
+        next_offset = offset + limit
+        if next_offset >= total:
+            next_offset = ""
+
+        data = (files, next_offset, total, counts)
+
+        # 💾 SAVE TO CACHE (with cleanup)
+        clean_old_cache()
+        SEARCH_CACHE[cache_key] = (now, data)
+
+        return data
+        
+    except PyMongoError as e:
+        logger.error(f"❌ Search error: {e}")
+        return [], "", 0, {}
+
+# ======================================================
+# 🔢 SEARCH COUNTS ONLY (UI BUTTONS)
+# ======================================================
+
+async def get_search_counts(query):
+    query = query.strip().lower()
+    if not query:
+        return {}
+
+    q = {"$text": {"$search": query}}
+
+    try:
+        return {
+            name: col.count_documents(q)
+            for name, col in COLLECTIONS.items()
+        }
+    except PyMongoError as e:
+        logger.error(f"❌ Count error: {e}")
+        return {}
+
+# ======================================================
+# 🗑️ DELETE FILES - IMPROVED LOGIC
+# ======================================================
+
+async def delete_files(query, collection_names=None):
+    """
+    Delete files from specific collections or all collections.
+    
+    Args:
+        query: Search query
+        collection_names: List of collection names ['primary', 'cloud'] 
+                         or single name 'primary' 
+                         or None for all collections
+    
+    Returns:
+        dict: {collection_name: deleted_count}
+    """
+    query = query.strip().lower()
+    if not query:
+        return {}
+
+    q = {"$text": {"$search": query}}
+    deleted_counts = {}
+
+    try:
+        # Convert single string to list
+        if isinstance(collection_names, str):
+            collection_names = [collection_names]
+        
+        # Delete from specified collections or all
+        if collection_names:
+            for name in collection_names:
+                if name in COLLECTIONS:
+                    col = get_collection(name)
+                    result = col.delete_many(q)
+                    deleted_counts[name] = result.deleted_count
+                    logger.info(f"🗑️ Deleted {result.deleted_count} files from {name}")
+        else:
+            # Delete from all collections
+            for name, col in COLLECTIONS.items():
+                result = col.delete_many(q)
+                deleted_counts[name] = result.deleted_count
+                logger.info(f"🗑️ Deleted {result.deleted_count} files from {name}")
+
+        SEARCH_CACHE.clear()
+        return deleted_counts
+        
+    except PyMongoError as e:
+        logger.error(f"❌ Delete error: {e}")
+        return {}
+
+
+async def delete_all_files(collection_names=None, confirm=False):
+    """
+    ⚠️ DANGER: Delete ALL files from collection(s)
+    
+    Args:
+        collection_names: List/string of collections or None for all
+        confirm: Must be True to actually delete (safety check)
+    
+    Returns:
+        dict: {collection_name: deleted_count}
+    """
+    if not confirm:
+        return {"error": "⚠️ Confirmation required! Set confirm=True"}
+    
+    deleted_counts = {}
+    
+    try:
+        # Convert single string to list
+        if isinstance(collection_names, str):
+            collection_names = [collection_names]
+        
+        if collection_names:
+            for name in collection_names:
+                if name in COLLECTIONS:
+                    col = get_collection(name)
+                    result = col.delete_many({})  # Empty query = delete all
+                    deleted_counts[name] = result.deleted_count
+                    logger.warning(f"⚠️ DELETED ALL {result.deleted_count} files from {name}")
+        else:
+            # Delete ALL from ALL collections
+            for name, col in COLLECTIONS.items():
+                result = col.delete_many({})
+                deleted_counts[name] = result.deleted_count
+                logger.warning(f"⚠️ DELETED ALL {result.deleted_count} files from {name}")
+
+        SEARCH_CACHE.clear()
+        return deleted_counts
+        
+    except PyMongoError as e:
+        logger.error(f"❌ Delete all error: {e}")
+        return {}
+
+
+async def get_collection_stats(collection_names=None):
+    """
+    Get file count and total size for collections
+    
+    Args:
+        collection_names: List/string of collections or None for all
+    
+    Returns:
+        dict: {collection_name: {count, total_size}}
+    """
+    stats = {}
+    
+    try:
+        # Convert single string to list
+        if isinstance(collection_names, str):
+            collection_names = [collection_names]
+        
+        collections_to_check = (
+            {name: get_collection(name) for name in collection_names if name in COLLECTIONS}
+            if collection_names
+            else COLLECTIONS
+        )
+        
+        for name, col in collections_to_check.items():
+            count = col.count_documents({})
+            
+            # Calculate total size
+            pipeline = [
+                {"$group": {
+                    "_id": None,
+                    "total_size": {"$sum": "$file_size"}
+                }}
+            ]
+            result = list(col.aggregate(pipeline))
+            total_size = result[0]["total_size"] if result else 0
+            
+            stats[name] = {
+                "count": count,
+                "total_size": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2)
+            }
+        
+        return stats
+        
+    except PyMongoError as e:
+        logger.error(f"❌ Stats error: {e}")
+        return {}
+
+
+async def delete_file_by_id(file_id, collection_names=None):
+    """
+    Delete specific file by file_id from collections.
+    
+    Args:
+        file_id: Unique file identifier
+        collection_names: List/string of collections or None for all
+    
+    Returns:
+        dict: {collection_name: deleted_count}
+    """
+    deleted_counts = {}
+    
+    try:
+        # Convert single string to list
+        if isinstance(collection_names, str):
+            collection_names = [collection_names]
+        
+        if collection_names:
+            for name in collection_names:
+                if name in COLLECTIONS:
+                    col = get_collection(name)
+                    result = col.delete_one({"file_id": file_id})
+                    deleted_counts[name] = result.deleted_count
+        else:
+            for name, col in COLLECTIONS.items():
+                result = col.delete_one({"file_id": file_id})
+                deleted_counts[name] = result.deleted_count
+
+        SEARCH_CACHE.clear()
+        return deleted_counts
+        
+    except PyMongoError as e:
+        logger.error(f"❌ Delete by ID error: {e}")
+        return {}
+
+# ======================================================
+# 📂 FILE DETAILS
+# ======================================================
+
+async def get_file_details(file_id):
+    try:
+        for col in COLLECTIONS.values():
+            doc = col.find_one({"file_id": file_id})
+            if doc:
+                return doc
+        return None
+    except PyMongoError as e:
+        logger.error(f"❌ Get file details error: {e}")
+        return None
+
+# ======================================================
+# 🔁 MOVE / COPY (MANUAL ONLY)
+# ======================================================
+
+async def move_file(file_id, from_col, to_col):
+    try:
+        src = get_collection(from_col)
+        dst = get_collection(to_col)
+
+        file = src.find_one({"file_id": file_id})
+        if not file:
+            return False, "File not found"
+
+        file["_id"] = ObjectId()
+        file["collection_type"] = to_col
+        file["moved_date"] = datetime.utcnow()
+
+        dst.insert_one(file)
+        src.delete_one({"file_id": file_id})
+        
+        SEARCH_CACHE.clear()
+        logger.info(f"✅ Moved file from {from_col} to {to_col}")
+        return True, "Moved successfully"
+        
+    except DuplicateKeyError:
+        return False, "Already exists in target"
+    except PyMongoError as e:
+        logger.error(f"❌ Move file error: {e}")
+        return False, f"Database error: {str(e)}"
+
+
+async def copy_file(file_id, from_col, to_col):
+    try:
+        src = get_collection(from_col)
+        dst = get_collection(to_col)
+
+        file = src.find_one({"file_id": file_id})
+        if not file:
+            return False, "File not found"
+
+        file["_id"] = ObjectId()
+        file["collection_type"] = to_col
+        file["copied_date"] = datetime.utcnow()
+
+        dst.insert_one(file)
+        
+        SEARCH_CACHE.clear()
+        logger.info(f"✅ Copied file from {from_col} to {to_col}")
+        return True, "Copied successfully"
+        
+    except DuplicateKeyError:
+        return False, "Already exists in target"
+    except PyMongoError as e:
+        logger.error(f"❌ Copy file error: {e}")
+        return False, f"Database error: {str(e)}"
+
+
+async def bulk_move_files(file_ids, from_col, to_col):
+    """Move multiple files at once"""
+    success = 0
+    failed = 0
+    
+    for file_id in file_ids:
+        result, msg = await move_file(file_id, from_col, to_col)
+        if result:
+            success += 1
+        else:
+            failed += 1
+    
+    return success, failed
+
+
+async def bulk_copy_files(file_ids, from_col, to_col):
+    """Copy multiple files at once"""
+    success = 0
+    failed = 0
+    
+    for file_id in file_ids:
+        result, msg = await copy_file(file_id, from_col, to_col)
+        if result:
+            success += 1
+        else:
+            failed += 1
+    
+    return success, failed
+
+# ======================================================
+# 🧬 FILE ID ENCODING (TELEGRAM SAFE)
+# ======================================================
+
+def encode_file_id(s: bytes) -> str:
+    r = b""
+    n = 0
+    for i in s + bytes([22]) + bytes([4]):
+        if i == 0:
+            n += 1
+        else:
+            if n:
+                r += b"\x00" + bytes([n])
+                n = 0
+            r += bytes([i])
+    return base64.urlsafe_b64encode(r).decode().rstrip("=")
+
+
+def unpack_new_file_id(new_file_id):
+    try:
+        decoded = FileId.decode(new_file_id)
+        return encode_file_id(
+            pack(
+                "<iiqq",
+                int(decoded.file_type),
+                decoded.dc_id,
+                decoded.media_id,
+                decoded.access_hash
+            )
+        )
+    except Exception as e:
+        logger.error(f"❌ File ID decode error: {e}")
+        raise
